@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RushdAI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Amiri:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+* { box-sizing:border-box; margin:0; padding:0; }
+body { font-family:system-ui,-apple-system,sans-serif; background:#f8fafc; height:100vh; overflow:hidden; }
+.ar { font-family:'Amiri',serif; direction:rtl; text-align:right; }
+button { cursor:pointer; font-family:inherit; }
+textarea.ar { resize:vertical; }
+.drag-target { outline:2px dashed #2563eb !important; outline-offset:2px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script>
+// ── PDF.js worker ─────────────────────────────────────────────────────────────
+pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+const {useState,useRef,useEffect,useCallback,useMemo}=React;
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT=`You are an expert Arabic OCR system. Extract text from scanned Arabic book pages.
+
+CONTENT TYPES — classify every block precisely:
+1. pageheader — Book's own printed running header at top of page (book name + chapter + page number). Every page has this. NEVER confuse with chapter headings.
+2. heading    — Chapter/section titles: باب / فصل markers, numbered chapter titles.
+3. basmala    — Only بِسْمِ اللَّهِ الرَّحْمَنِ الرَّحِيمِ. Never classify as heading.
+4. prose      — Regular flowing paragraphs and hadith chains.
+5. poetry     — Verse poetry. Each بيت on ONE line: صدر *** عجز
+6. quran      — Quranic text with full tashkeel. Wrap ayahs in ﴿ ﴾ with ayah numbers if visible.
+7. footnote   — Inline reference markers like [م:٢٣٣٧] appearing after hadith text.
+8. endnote    — Numbered notes at page bottom in smaller font: (١)(٢). Each note on its own line.
+
+Return ONLY valid JSON — no markdown, no explanation:
+{"sections":[{"type":"pageheader|heading|basmala|prose|poetry|quran|footnote|endnote","content":"text"}],"notes":"optional"}
+
+RULES: Preserve ALL tashkeel. Preserve ﷺ ﷻ ؓ ؔ exactly. Mark unreadable with [؟]. RTL order.
+Blank/decorative: {"sections":[],"notes":"non-text page"}`;
+
+const STYLES={
+  pageheader:{bg:'#f1f5f9',border:'#94a3b8',badge:'#e2e8f0',bc:'#64748b',icon:'📄'},
+  heading:   {bg:'#fffbeb',border:'#fcd34d',badge:'#fef3c7',bc:'#b45309',icon:'📌'},
+  basmala:   {bg:'#fdf4ff',border:'#e9d5ff',badge:'#f3e8ff',bc:'#7e22ce',icon:'☪️'},
+  prose:     {bg:'#f8fafc',border:'#cbd5e1',badge:'#e2e8f0',bc:'#475569',icon:'📝'},
+  poetry:    {bg:'#faf5ff',border:'#d8b4fe',badge:'#ede9fe',bc:'#7c3aed',icon:'✍️'},
+  quran:     {bg:'#f0fdf4',border:'#86efac',badge:'#dcfce7',bc:'#15803d',icon:'🕌'},
+  footnote:  {bg:'#f0f9ff',border:'#bae6fd',badge:'#e0f2fe',bc:'#0369a1',icon:'🔗'},
+  endnote:   {bg:'#fafafa',border:'#e2e8f0',badge:'#f1f5f9',bc:'#64748b',icon:'🔢'},
+};
+const SEC_TYPES=['prose','heading','basmala','pageheader','poetry','quran','footnote','endnote'];
+const HEADER_TYPES=new Set(['heading']);
+const EXPORT_SKIP=new Set(['pageheader']);
+const DEFAULT_DISCLAIMER_AR='أُعِدَّ هذا الكتاب الإلكتروني خدمةً لكتاب الله وسنة نبيه ﷺ، ولوجه الله تعالى خالصًا، ولا يجوز بيعه أو الانتفاع به تجاريًا.';
+const DEFAULT_DISCLAIMER_EN='This ebook was prepared for the sake of Allah and in service of Islamic knowledge. It is not to be sold or used for commercial purposes.';
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function xmlEsc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function extractJSON(raw){
+  if(!raw)return null;
+  try{return JSON.parse(raw.trim());}catch(e){}
+  const f=raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if(f){try{return JSON.parse(f[1].trim());}catch(e){}}
+  const b=raw.match(/(\{[\s\S]*\})/);
+  if(b){try{return JSON.parse(b[1]);}catch(e){}}
+  return null;
+}
+async function callAPI(body){
+  const resp=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const text=await resp.text();
+  if(!resp.ok){let msg=`HTTP ${resp.status}`;try{const e=JSON.parse(text);msg=e?.error?.message||msg;const err=new Error(msg);err.errType=e?.error?.type||'';throw err;}catch(e){if(e.errType!==undefined)throw e;throw new Error(msg+': '+text.slice(0,200));}}
+  try{return JSON.parse(text);}catch(e){throw new Error('Non-JSON response: '+text.slice(0,200));}
+}
+function splitEndnotes(content){
+  if(!content)return[];
+  const lines=content.split('\n').map(l=>l.trim()).filter(Boolean);
+  if(lines.length>1)return lines;
+  const parts=content.split(/(?=[\(（][١٢٣٤٥٦٧٨٩٠\d][\)）])/);
+  return(parts.length>1?parts:[content]).map(p=>p.trim()).filter(Boolean);
+}
+function arabicToInt(s){
+  const m={'٠':0,'١':1,'٢':2,'٣':3,'٤':4,'٥':5,'٦':6,'٧':7,'٨':8,'٩':9};
+  let r=0;for(const c of s){if(c in m)r=r*10+m[c];else if(/\d/.test(c))r=r*10+parseInt(c);}return r;
+}
+function renderInlineBrackets(text){
+  if(!text||!text.includes('['))return text;
+  return text.split(/(\[[^\]]+\])/g).map((p,i)=>
+    /^\[.*\]$/.test(p)?React.createElement('span',{key:i,style:{fontSize:'0.75em',color:'#94a3b8',fontStyle:'italic',margin:'0 2px'}},p):p);
+}
+
+// ── EPUB builder (pure JS, no deps) ──────────────────────────────────────────
+const ENC=new TextEncoder();
+function u8str(s){return ENC.encode(s);}
+const CRC_TABLE=(()=>{const t=new Uint32Array(256);for(let i=0;i<256;i++){let v=i;for(let j=0;j<8;j++)v=v&1?(v>>>1)^0xEDB88320:(v>>>1);t[i]=v;}return t;})();
+function crc32(buf){let c=0xFFFFFFFF>>>0;for(let i=0;i<buf.length;i++)c=(CRC_TABLE[(c^buf[i])&0xFF]^(c>>>8))>>>0;return(c^0xFFFFFFFF)>>>0;}
+function buildZIP(files){
+  const entries=files.map(f=>({name:u8str(f.name),data:f.data,crc:crc32(f.data),size:f.data.length,offset:0}));
+  let localSize=0;entries.forEach(e=>{localSize+=30+e.name.length+e.size;});
+  let cdSize=0;entries.forEach(e=>{cdSize+=46+e.name.length;});
+  const buf=new ArrayBuffer(localSize+cdSize+22);
+  const view=new DataView(buf);const bytes=new Uint8Array(buf);
+  let pos=0;
+  const w16=v=>{view.setUint16(pos,v,true);pos+=2;};
+  const w32=v=>{view.setUint32(pos,v>>>0,true);pos+=4;};
+  const wb=arr=>{bytes.set(arr,pos);pos+=arr.length;};
+  const now=new Date();
+  const dosDate=((now.getFullYear()-1980)<<9)|((now.getMonth()+1)<<5)|now.getDate();
+  const dosTime=(now.getHours()<<11)|(now.getMinutes()<<5)|(Math.floor(now.getSeconds()/2));
+  entries.forEach(e=>{
+    e.offset=pos;
+    w32(0x04034B50);w16(20);w16(0);w16(0);w16(dosTime);w16(dosDate);
+    w32(e.crc);w32(e.size);w32(e.size);w16(e.name.length);w16(0);
+    wb(e.name);wb(e.data);
+  });
+  const cdOffset=pos;
+  entries.forEach(e=>{
+    w32(0x02014B50);w16(20);w16(20);w16(0);w16(0);w16(dosTime);w16(dosDate);
+    w32(e.crc);w32(e.size);w32(e.size);w16(e.name.length);
+    w16(0);w16(0);w16(0);w16(0);w32(0);w32(e.offset);wb(e.name);
+  });
+  w32(0x06054B50);w16(0);w16(0);w16(entries.length);w16(entries.length);
+  w32(pos-cdOffset);w32(cdOffset);w16(0);
+  return new Uint8Array(buf);
+}
+
+// ── EPUB generation ───────────────────────────────────────────────────────────
+function buildEPUBExport(results,totalPages,meta){
+  const {title,author,disclaimerAr,disclaimerEn}=meta;
+  const allFootnotes={};
+  const fnCounter={v:0};
+  const makeFnId=()=>`fn${++fnCounter.v}`;
+
+  // ── Process sections: match endnotes strictly local to their prose block ──
+  function processSection(sections){
+    const out=[];
+    let i=0;
+    while(i<sections.length){
+      const s=sections[i];
+      const t=s.type;const content=(s.content||'').trim();
+      if(!content||EXPORT_SKIP.has(t)){i++;continue;}
+      if(['heading','basmala','quran','poetry','footnote'].includes(t)){out.push({t,content});i++;continue;}
+      if(t==='endnote'){i++;continue;}
+      if(t==='prose'){
+        const enMap={};
+        let j=i+1;
+        while(j<sections.length&&sections[j].type==='endnote'){
+          splitEndnotes(sections[j].content).forEach(note=>{
+            const m=note.match(/^[\(（]([١٢٣٤٥٦٧٨٩٠\d]+)[\)）]/);
+            if(m){const num=arabicToInt(m[1]);if(!(num in enMap)){const id=makeFnId();enMap[num]=(id,note);allFootnotes[id]=note;enMap[num]={id,note};}}
+          });
+          j++;
+        }
+        // Replace markers
+        const replaced=content.replace(/[\(（]([١٢٣٤٥٦٧٨٩٠\d]+)[\)）]/g,(match,ns)=>{
+          const num=arabicToInt(ns);
+          if(enMap[num]){return`\x00LINK:${enMap[num].id}:(${ns})\x00`;}
+          return`\x00SUPER:(${ns})\x00`;
+        });
+        const parts=replaced.split('\x00');
+        const escaped=parts.map(p=>{
+          if(p.startsWith('LINK:')){const[,id,marker]=p.split(':',3);return`<a href="footnotes.xhtml#${id}" epub:type="noteref" class="noteref">${xmlEsc(marker)}</a>`;}
+          if(p.startsWith('SUPER:')){return`<span class="noteref-plain">${xmlEsc(p.slice(6))}</span>`;}
+          const esc=xmlEsc(p);return esc.replace(/\[([^\]<>]+)\]/g,'<span class="footnote-ref">[$1]</span>');
+        });
+        out.push({t:'prose_html',content:escaped.join('')});
+        i=j;continue;
+      }
+      i++;
+    }
+    return out;
+  }
+
+  const toc=[];let chN=0;
+  const bodyParts=[`<div class="disclaimer-page"><h1>${xmlEsc(title)}</h1><p class="author">${xmlEsc(author||'')}</p><div class="disc"><p class="disc-ar">${xmlEsc(disclaimerAr)}</p><p class="disc-en">${disclaimerEn}</p><p class="credit">Created by RushdAI</p></div></div>\n`];
+
+  for(let i=1;i<=totalPages;i++){
+    const r=results[String(i)]||results[i];
+    if(!r)continue;
+    if(r.status==='skipped')continue;
+    if(r.status==='image'){bodyParts.push(`<div class="image-page"><p>[صورة: ${i}]</p></div>\n`);continue;}
+    if(!r.sections?.length)continue;
+    let firstH=true;
+    processSection(r.sections).forEach(item=>{
+      const{t,content}=item;
+      if(t==='heading'){
+        let anchor='';
+        if(firstH){chN++;const id=`ch${chN}`;toc.push({id,text:content.trim()});anchor=` id="${id}"`;firstH=false;}
+        bodyParts.push(`<h2 class="heading"${anchor}>${xmlEsc(content)}</h2>\n`);
+      }else if(t==='basmala'){bodyParts.push(`<div class="basmala">${xmlEsc(content)}</div>\n`);}
+      else if(t==='quran'){bodyParts.push(`<div class="quran">${content.split('\n').map(l=>`<div>${xmlEsc(l)}</div>`).join('')}</div>\n`);}
+      else if(t==='poetry'){
+        const rows=content.split('\n').filter(l=>l.trim()).map(v=>{
+          const p=v.split('***');
+          return p.length<2?`<div class="verse-full">${xmlEsc(v.trim())}</div>`
+            :`<div class="verse"><span class="sadr">${xmlEsc(p[0].trim())}</span><span class="sep">◆</span><span class="ajuz">${xmlEsc(p[1].trim())}</span></div>`;
+        });
+        bodyParts.push(`<div class="poetry">${rows.join('')}</div>\n`);
+      }else if(t==='footnote'){bodyParts.push(`<span class="fnref">[${xmlEsc(content)}]</span>\n`);}
+      else if(t==='prose_html'){bodyParts.push(`<p class="prose">${content}</p>\n`);}
+    });
+  }
+
+  const body=bodyParts.join('');
+  const fnItems=Object.entries(allFootnotes).map(([id,note])=>`<aside id="${id}" epub:type="footnote"><p class="fn-text">${xmlEsc(note)}</p></aside>`).join('\n');
+  const tocItems=toc.map(e=>`<li><a href="content.xhtml#${e.id}">${xmlEsc(e.text)}</a></li>`).join('\n');
+  const now=new Date().toISOString().slice(0,19)+'Z';
+
+  const CONTENT=`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="ar" lang="ar" dir="rtl">
+<head><meta charset="UTF-8"/><title>${xmlEsc(title)}</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body epub:type="bodymatter">${body}</body></html>`;
+
+  const FOOTNOTES=`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="ar" lang="ar" dir="rtl">
+<head><meta charset="UTF-8"/><title>الحواشي</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body epub:type="backmatter"><section epub:type="footnotes">${fnItems}</section></body></html>`;
+
+  const NAV=`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="ar" lang="ar">
+<head><meta charset="UTF-8"/><title>فهرس</title><link rel="stylesheet" type="text/css" href="style.css"/></head>
+<body><nav epub:type="toc" id="toc" dir="rtl"><h1>فهرس المحتويات</h1><ol epub:type="list"><li><a href="content.xhtml">${xmlEsc(title)}</a></li>${tocItems}</ol></nav></body></html>`;
+
+  const PKG=`<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid" xml:lang="ar" dir="rtl">
+<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:identifier id="uid">rushdai-${Date.now()}</dc:identifier>
+<dc:language>ar</dc:language><dc:title>${xmlEsc(title)}</dc:title>
+${author?`<dc:creator>${xmlEsc(author)}</dc:creator>`:''}
+<meta property="dcterms:modified">${now}</meta>
+</metadata>
+<manifest>
+<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+<item id="content" href="content.xhtml" media-type="application/xhtml+xml"/>
+<item id="footnotes" href="footnotes.xhtml" media-type="application/xhtml+xml"/>
+<item id="css" href="style.css" media-type="text/css"/>
+</manifest>
+<spine page-progression-direction="rtl">
+<itemref idref="nav" linear="no"/>
+<itemref idref="content" linear="yes"/>
+<itemref idref="footnotes" linear="no"/>
+</spine></package>`;
+
+  const CONTAINER=`<?xml version="1.0" encoding="UTF-8"?>
+<container version="1.0" xmlns="urn:oasis:schemas:container">
+<rootfiles><rootfile full-path="OEBPS/package.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>`;
+
+  const CSS=`@charset "UTF-8";
+body{direction:rtl;font-family:'Amiri','Traditional Arabic',serif;font-size:1em;line-height:2.2;text-align:justify;-webkit-hyphens:none;margin:1em 1.5em;}
+.disclaimer-page{text-align:center;margin:2em 0;page-break-after:always;}
+.disclaimer-page h1{font-size:1.5em;font-weight:bold;margin:0.5em 0;border-bottom:1px solid #ccc;padding-bottom:0.4em;}
+.author{font-size:1.1em;color:#444;font-style:italic;margin:0.2em 0 1.5em;}
+.disc{border:1px solid #ddd;padding:1em;margin:1.5em auto;max-width:90%;background:#fafafa;}
+.disc-ar{font-size:0.9em;line-height:1.9;margin-bottom:0.8em;direction:rtl;text-align:right;}
+.disc-en{font-size:0.82em;color:#555;line-height:1.8;direction:ltr;text-align:left;font-style:italic;}
+.credit{font-size:0.75em;color:#aaa;margin-top:1em;text-align:center;direction:ltr;}
+h2.heading{text-align:center;font-size:1.15em;font-weight:bold;margin:1.5em 0 1em;border-bottom:1px solid #eee;padding-bottom:0.3em;page-break-before:always;}
+h2.heading:first-of-type{page-break-before:avoid;}
+.basmala{text-align:center;font-size:1.3em;margin:1em 0;line-height:2.5;}
+.quran{text-align:center;font-size:1.1em;line-height:2.8;border:1px solid #aacfaa;padding:0.7em 1em;margin:0.8em 0;background-color:#f6fff6;}
+.poetry{margin:0.8em auto;max-width:90%;}
+.verse{display:table;width:100%;margin:0.2em 0;}
+.sadr{display:table-cell;text-align:right;width:46%;direction:rtl;padding:0.1em 0;}
+.sep{display:table-cell;text-align:center;width:8%;color:#ccc;vertical-align:middle;}
+.ajuz{display:table-cell;text-align:left;width:46%;direction:rtl;padding:0.1em 0;}
+.verse-full{text-align:center;padding:0.2em 0;}
+.prose{margin:0.3em 0;text-align:justify;}
+.fnref{font-size:0.72em;color:#888;font-style:italic;}
+.noteref{font-size:0.72em;color:#005599;text-decoration:none;vertical-align:super;}
+.noteref-plain{font-size:0.72em;color:#888;vertical-align:super;}
+aside[epub|type~="footnote"]{display:none;}
+.fn-text{font-size:0.85em;color:#222;line-height:1.9;direction:rtl;text-align:right;margin:0;}
+.image-page{text-align:center;color:#888;font-style:italic;margin:1em 0;}`;
+
+  const zipData=buildZIP([
+    {name:'mimetype',data:u8str('application/epub+zip')},
+    {name:'META-INF/container.xml',data:u8str(CONTAINER)},
+    {name:'OEBPS/package.opf',data:u8str(PKG)},
+    {name:'OEBPS/nav.xhtml',data:u8str(NAV)},
+    {name:'OEBPS/content.xhtml',data:u8str(CONTENT)},
+    {name:'OEBPS/footnotes.xhtml',data:u8str(FOOTNOTES)},
+    {name:'OEBPS/style.css',data:u8str(CSS)},
+  ]);
+  // Filename = book title (Apple Books uses filename as running header)
+  const fname=(title||'arabic-book').replace(/\s+/g,'_')+'.epub';
+  const blob=new Blob([zipData],{type:'application/epub+zip'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=fname;
+  document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},5000);
+}
+
+// ── PDF generation (browser-print, chapter-end footnotes) ────────────────────
+function buildPDFExport(results,totalPages,meta){
+  const {title,author,disclaimerAr,disclaimerEn}=meta;
+
+  function processForPDF(sections){
+    const body=[];const footnotes=[];
+    let i=0;
+    while(i<sections.length){
+      const s=sections[i];const t=s.type;const content=(s.content||'').trim();
+      if(!content||EXPORT_SKIP.has(t)){i++;continue;}
+      if(['heading','basmala','quran','poetry','footnote'].includes(t)){body.push({t,content});i++;continue;}
+      if(t==='endnote'){i++;continue;}
+      if(t==='prose'){
+        const enMap={};
+        let j=i+1;
+        while(j<sections.length&&sections[j].type==='endnote'){
+          splitEndnotes(sections[j].content).forEach(note=>{
+            const m=note.match(/^[\(（]([١٢٣٤٥٦٧٨٩٠\d]+)[\)）]/);
+            if(m){const num=arabicToInt(m[1]);if(!(num in enMap)){enMap[num]={ns:m[1],note};footnotes.push({ns:m[1],note});}}
+          });
+          j++;
+        }
+        const replaced=content.replace(/[\(（]([١٢٣٤٥٦٧٨٩٠\d]+)[\)）]/g,(match,ns)=>{
+          const num=arabicToInt(ns);
+          return enMap[num]?`<span class="noteref">(${ns})</span>`:`<span class="noteref-plain">(${ns})</span>`;
+        });
+        const parts=replaced.split(/(<span class="note[^"]*">[^<]*<\/span>)/g);
+        const final=parts.map(p=>p.startsWith('<span')?p:(xmlEsc(p).replace(/\[([^\]<>]+)\]/g,'<span class="fnref">[$1]</span>'))).join('');
+        body.push({t:'prose_html',content:final});
+        i=j;continue;
+      }
+      i++;
+    }
+    return{body,footnotes};
+  }
+
+  const parts=[];
+  parts.push(`<div class="title-page"><div class="tp-inner">
+<h1>${xmlEsc(title)}</h1><p class="author">${xmlEsc(author||'')}</p>
+<div class="disc"><p class="disc-ar">${xmlEsc(disclaimerAr)}</p><p class="disc-en">${disclaimerEn}</p>
+<p class="credit">Created by RushdAI</p></div></div></div>`);
+
+  let chN=0;
+  for(let i=1;i<=totalPages;i++){
+    const r=results[String(i)]||results[i];
+    if(!r)continue;
+    if(r.status==='skipped')continue;
+    if(r.status==='image'){parts.push(`<div class="image-page"><p>[صورة]</p></div>`);continue;}
+    if(!r.sections?.length)continue;
+    const{body,footnotes}=processForPDF(r.sections);
+    let firstH=true;
+    body.forEach(({t,content})=>{
+      if(t==='heading'){
+        if(firstH){chN++;parts.push(`<h2 class="ch-heading" id="ch${chN}">${xmlEsc(content)}</h2>`);firstH=false;}
+        else parts.push(`<h3 class="sub-heading">${xmlEsc(content)}</h3>`);
+      }else if(t==='basmala'){parts.push(`<div class="basmala">${xmlEsc(content)}</div>`);}
+      else if(t==='quran'){parts.push(`<div class="quran">${content.split('\n').map(l=>`<div>${xmlEsc(l)}</div>`).join('')}</div>`);}
+      else if(t==='poetry'){
+        const rows=content.split('\n').filter(l=>l.trim()).map(v=>{
+          const p=v.split('***');
+          return p.length<2?`<div class="vfull">${xmlEsc(v.trim())}</div>`
+            :`<tr><td class="sadr">${xmlEsc(p[0].trim())}</td><td class="sep">◆</td><td class="ajuz">${xmlEsc(p[1].trim())}</td></tr>`;
+        });
+        const hasTable=rows.some(r=>r.startsWith('<tr>'));
+        parts.push(hasTable?`<table class="poetry">${rows.join('')}</table>`:`<div class="poetry-block">${rows.join('')}</div>`);
+      }else if(t==='footnote'){parts.push(`<span class="fnref">[${xmlEsc(content)}]</span>`);}
+      else if(t==='prose_html'){parts.push(`<p class="prose">${content}</p>`);}
+    });
+    if(footnotes.length){
+      parts.push(`<div class="ch-footnotes"><div class="fn-rule"></div>${footnotes.map(f=>`<p class="fn-item">${xmlEsc(f.note)}</p>`).join('')}</div>`);
+    }
+  }
+
+  const HTML=`<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<title>${xmlEsc(title)}</title>
+<link href="https://fonts.googleapis.com/css2?family=Amiri:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+@page{size:A4;margin:2.5cm 3cm;@bottom-center{content:counter(page);font-family:'Amiri',serif;font-size:9pt;color:#888;}@top-center{content:string(ch-title);font-family:'Amiri',serif;font-size:9pt;color:#888;}}
+@page:first{@top-center{content:none;}@bottom-center{content:none;}}
+*{box-sizing:border-box;}
+body{direction:rtl;font-family:'Amiri','Traditional Arabic',serif;font-size:12pt;line-height:2.2;text-align:justify;color:#1a1a1a;margin:0;}
+.title-page{page-break-after:always;display:flex;align-items:center;justify-content:center;min-height:24cm;text-align:center;}
+.tp-inner{max-width:14cm;}
+h1{font-size:24pt;font-weight:bold;margin:0 0 0.3em;border-bottom:1.5pt solid #333;padding-bottom:0.3em;line-height:1.4;}
+.author{font-size:13pt;color:#444;font-style:italic;margin:0.2em 0 2em;}
+.disc{border:1pt solid #ccc;padding:1em 1.2em;margin:1.5em 0;background:#fafafa;text-align:right;}
+.disc-ar{font-size:10pt;line-height:1.9;margin:0 0 0.6em;direction:rtl;}
+.disc-en{font-size:9pt;color:#555;line-height:1.7;direction:ltr;text-align:left;font-style:italic;margin:0;}
+.credit{font-size:8pt;color:#aaa;margin-top:0.8em;text-align:center;direction:ltr;}
+.ch-heading{string-set:ch-title content();text-align:center;font-size:14pt;font-weight:bold;margin:0 0 0.8em;border-bottom:0.5pt solid #ccc;padding-bottom:0.3em;page-break-before:always;page-break-after:avoid;}
+.ch-heading:first-of-type{page-break-before:avoid;}
+.sub-heading{text-align:center;font-size:12pt;font-weight:bold;margin:0.8em 0 0.4em;}
+.basmala{text-align:center;font-size:14pt;margin:0.6em 0;line-height:2.5;}
+.quran{text-align:center;font-size:12pt;line-height:2.8;border:0.5pt solid #aacfaa;padding:0.6em 1em;margin:0.6em 0;background:#f6fff6;}
+.poetry{width:90%;margin:0.6em auto;border-collapse:collapse;}
+.sadr{text-align:right;direction:rtl;width:46%;padding:0.1em 0;}
+.sep{text-align:center;width:8%;color:#bbb;}
+.ajuz{text-align:left;direction:rtl;width:46%;padding:0.1em 0;}
+.poetry-block{margin:0.6em auto;max-width:90%;text-align:center;}
+.vfull{text-align:center;}
+.prose{margin:0.2em 0;text-align:justify;}
+.fnref{font-size:7.5pt;color:#888;font-style:italic;}
+.noteref{font-size:7.5pt;color:#333;font-weight:bold;vertical-align:super;}
+.noteref-plain{font-size:7.5pt;color:#888;vertical-align:super;}
+.image-page{text-align:center;color:#888;font-style:italic;margin:1em 0;page-break-after:always;}
+.ch-footnotes{margin-top:1em;}
+.fn-rule{border:none;border-top:0.5pt solid #999;width:40%;margin:0 0 0.5em 0;}
+.fn-item{font-size:8.5pt;color:#333;line-height:1.85;margin:0.1em 0;text-align:right;direction:rtl;page-break-inside:avoid;}
+</style>
+</head>
+<body>${parts.join('\n')}
+<script>window.onload=function(){setTimeout(function(){window.print();},1200);};<\/script>
+</body></html>`;
+
+  const blob=new Blob([HTML],{type:'text/html;charset=utf-8'});
+  const url=URL.createObjectURL(blob);
+  const iframe=document.createElement('iframe');
+  iframe.style.cssText='position:fixed;inset:0;width:100%;height:100%;border:none;z-index:9999;background:white;';
+  iframe.src=url;document.body.appendChild(iframe);
+  const btn=document.createElement('button');
+  btn.textContent='✕ Close PDF view';
+  btn.style.cssText='position:fixed;top:12px;right:12px;z-index:10000;padding:8px 16px;background:#dc2626;color:white;border:none;border-radius:6px;font-size:14px;cursor:pointer;font-weight:700;';
+  btn.onclick=()=>{document.body.removeChild(iframe);document.body.removeChild(btn);URL.revokeObjectURL(url);};
+  document.body.appendChild(btn);
+}
+
+// ── Text export ───────────────────────────────────────────────────────────────
+function buildTextExport(results,totalPages){
+  const lines=[];
+  for(let i=1;i<=totalPages;i++){
+    const r=results[String(i)]||results[i];if(!r)continue;
+    if(r.status==='skipped')continue;
+    if(r.status==='image'){lines.push(`\n[IMAGE:page_${i}]\n`);continue;}
+    if(!r.sections?.length)continue;
+    r.sections.forEach(s=>{
+      if(!s.content?.trim()||EXPORT_SKIP.has(s.type))return;
+      if(s.type==='heading')lines.push('\n# '+s.content+'\n');
+      else if(s.type==='basmala')lines.push('\n{بسملة}\n'+s.content+'\n{/بسملة}\n');
+      else if(s.type==='quran')lines.push('\n{قرآن}\n'+s.content+'\n{/قرآن}\n');
+      else if(s.type==='poetry')lines.push('\n{شعر}\n'+s.content+'\n{/شعر}\n');
+      else if(s.type==='endnote')lines.push('\n{حاشية}\n'+s.content+'\n{/حاشية}\n');
+      else if(s.type==='footnote')lines.push(' ['+s.content+']');
+      else lines.push('\n'+s.content+'\n');
+    });
+  }
+  return lines.join('');
+}
+
+// ── SectionCard — outside App for stable React identity ──────────────────────
+const dragSrc={current:null};
+function SectionCard({sec,idx,pageNum,onUpdate,onDelete,onMove,onPushHistory}){
+  const st=STYLES[sec.type]||STYLES.prose;
+  const [editing,setEditing]=useState(false);
+  const [dragOver,setDragOver]=useState(false);
+  const taRef=useRef(null);
+  useEffect(()=>{
+    if(editing&&taRef.current){
+      const ta=taRef.current;ta.style.height='auto';
+      ta.style.height=Math.max(160,ta.scrollHeight)+'px';
+    }
+  },[editing]);
+  return React.createElement('div',{
+    className:'sec-card'+(dragOver?' drag-target':''),
+    draggable:true,
+    onDragStart:e=>{e.dataTransfer.effectAllowed='move';dragSrc.current=idx;},
+    onDragOver:e=>{e.preventDefault();setDragOver(true);},
+    onDragLeave:()=>setDragOver(false),
+    onDrop:e=>{e.preventDefault();setDragOver(false);if(dragSrc.current!==null&&dragSrc.current!==idx)onMove(dragSrc.current,idx);dragSrc.current=null;},
+    onDragEnd:()=>setDragOver(false),
+    style:{background:st.bg,border:`1px solid ${st.border}`,borderRadius:8,padding:'8px 12px'}
+  },
+    React.createElement('div',{style:{display:'flex',alignItems:'center',gap:6,marginBottom:6,flexWrap:'wrap'}},
+      React.createElement('span',{style:{color:'#94a3b8',fontSize:14,cursor:'grab',userSelect:'none'}},'⠿'),
+      React.createElement('select',{value:sec.type,onChange:e=>{e.stopPropagation();onPushHistory();onUpdate(idx,'type',e.target.value);},onClick:e=>e.stopPropagation(),
+        style:{fontSize:11,padding:'2px 4px',borderRadius:3,border:'1px solid #d1d5db',background:st.badge,color:st.bc,fontWeight:700}},
+        SEC_TYPES.map(t=>React.createElement('option',{key:t,value:t},`${STYLES[t]?.icon||''} ${t}`))),
+      React.createElement('div',{style:{flex:1}}),
+      React.createElement('button',{onClick:e=>{e.stopPropagation();setEditing(v=>!v);},
+        style:{fontSize:12,padding:'4px 12px',border:`1px solid ${editing?'#16a34a':'#2563eb'}`,borderRadius:4,background:'white',color:editing?'#16a34a':'#2563eb',fontWeight:700}},
+        editing?'✓ Done':'Edit'),
+      React.createElement('button',{onClick:e=>{e.stopPropagation();onPushHistory();onDelete(idx);},
+        style:{fontSize:12,padding:'4px 10px',border:'1px solid #fecaca',borderRadius:4,background:'#fff1f2',color:'#dc2626',fontWeight:700}},'Delete')
+    ),
+    editing
+      ?React.createElement('textarea',{ref:taRef,className:'ar',value:sec.content,onClick:e=>e.stopPropagation(),
+          onChange:e=>{onUpdate(idx,'content',e.target.value);e.target.style.height='auto';e.target.style.height=Math.max(160,e.target.scrollHeight)+'px';},
+          style:{width:'100%',minHeight:160,fontSize:'1rem',lineHeight:2.2,border:'1px solid #d1d5db',borderRadius:4,padding:'8px',background:'white',overflow:'hidden',display:'block'}})
+      :React.createElement('p',{className:'ar',style:{margin:0,
+          fontSize:sec.type==='quran'?'1.15rem':['endnote','footnote','pageheader'].includes(sec.type)?'0.82rem':'1rem',
+          lineHeight:['pageheader'].includes(sec.type)?1.6:2.2,whiteSpace:'pre-line',
+          color:['pageheader','endnote','footnote'].includes(sec.type)?'#94a3b8':'#1e293b',
+          fontStyle:sec.type==='pageheader'?'italic':'normal'}},
+        sec.type==='prose'?renderInlineBrackets(sec.content):sec.content)
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App(){
+  // ── State ──
+  const [pdfDoc,setPdfDoc]           =useState(null);
+  const [totalPages,setTotal]        =useState(0);
+  const [page,setPage]               =useState(1);
+  const [imgCache,setImgCache]       =useState({});
+  const [results,setResults]         =useState({});
+  const [history,setHistory]         =useState([]);
+  const [busy,setBusy]               =useState(false);
+  const [batchRunning,setBatch]      =useState(false);
+  const [batchPage,setBatchPage]     =useState(0);
+  const [bookKey,setBookKey]         =useState(null);
+  const [saveMsg,setSaveMsg]         =useState('');
+  const [preview,setPreview]         =useState(false);
+  const [showTOC,setShowTOC]         =useState(false);
+  const [showExport,setShowExport]   =useState(false);
+  const [showSR,setShowSR]           =useState(false);
+  const [srFind,setSrFind]           =useState('');
+  const [srReplace,setSrReplace]     =useState('');
+  const [srCS,setSrCS]               =useState(false);
+  const [srCount,setSrCount]         =useState(null);
+  const [showMeta,setShowMeta]       =useState(false);
+  const [meta,setMeta]               =useState({title:'',author:'',disclaimerAr:DEFAULT_DISCLAIMER_AR,disclaimerEn:DEFAULT_DISCLAIMER_EN});
+  const [exportText,setExportText]   =useState(null);
+  const [restoreData,setRestoreData] =useState(null);
+  const [testMsg,setTestMsg]         =useState('');
+  const canvasRef=useRef(null),hiddenRef=useRef(null),fileRef=useRef(null),backupRef=useRef(null),batchStop=useRef(false);
+
+  // ── Undo ──
+  const pushHistory=useCallback(()=>setHistory(h=>[...h.slice(-30),JSON.stringify(results)]),[results]);
+  const undo=()=>{if(!history.length)return;setResults(JSON.parse(history[history.length-1]));setHistory(h=>h.slice(0,-1));};
+
+  // ── Render PDF page ──
+  const renderPage=useCallback(async(doc,n,cvs)=>{
+    const pg=await doc.getPage(n),vp=pg.getViewport({scale:1.2});
+    cvs.width=vp.width;cvs.height=vp.height;
+    await pg.render({canvasContext:cvs.getContext('2d'),viewport:vp}).promise;
+    const MAX=1400;
+    if(cvs.width>MAX||cvs.height>MAX){const s=Math.min(MAX/cvs.width,MAX/cvs.height),c2=document.createElement('canvas');c2.width=Math.round(cvs.width*s);c2.height=Math.round(cvs.height*s);c2.getContext('2d').drawImage(cvs,0,0,c2.width,c2.height);return c2.toDataURL('image/jpeg',0.7);}
+    return cvs.toDataURL('image/jpeg',0.7);
+  },[]);
+
+  // ── Draw visible canvas ──
+  useEffect(()=>{
+    if(!pdfDoc||!canvasRef.current)return;
+    (async()=>{
+      let img=imgCache[page];
+      if(!img){img=await renderPage(pdfDoc,page,hiddenRef.current);setImgCache(c=>({...c,[page]:img}));}
+      const image=new Image();
+      image.onload=()=>{const cv=canvasRef.current;if(!cv)return;cv.width=image.width;cv.height=image.height;cv.getContext('2d').drawImage(image,0,0);};
+      image.src=img;
+    })();
+  },[pdfDoc,page,imgCache,renderPage]);
+
+  // ── Auto-save to localStorage ──
+  useEffect(()=>{
+    if(!bookKey||!Object.keys(results).length)return;
+    const cnt=Object.values(results).filter(r=>['done','skipped','image'].includes(r?.status)).length;
+    if(!cnt)return;
+    try{localStorage.setItem(bookKey,JSON.stringify({results,totalPages,meta}));setSaveMsg('Saved ('+cnt+' pages)');setTimeout(()=>setSaveMsg(''),2500);}
+    catch(e){}
+  },[results,bookKey,totalPages,meta]);
+
+  // ── Load PDF ──
+  const loadPDF=async(file)=>{
+    let ab,doc;
+    try{ab=await file.arrayBuffer();}catch(e){alert('Could not read file: '+e.message);return;}
+    try{doc=await pdfjsLib.getDocument({data:ab}).promise;}catch(e){alert('Could not load PDF: '+e.message);return;}
+    const key='ocr:'+file.name.replace(/[^a-zA-Z0-9]/g,'_')+'_'+file.size;
+    setBookKey(key);setPdfDoc(doc);setTotal(doc.numPages);setPage(1);setImgCache({});setBatchPage(0);setHistory([]);
+    const titleGuess=file.name.replace(/\.pdf$/i,'').replace(/[_-]/g,' ');
+    // Try restore from localStorage
+    try{
+      const saved=localStorage.getItem(key);
+      if(saved){
+        const parsed=JSON.parse(saved);
+        const sr=parsed.results||parsed;
+        const cnt=Object.values(sr).filter(r=>['done','skipped','image'].includes(r?.status)).length;
+        if(cnt>0){
+          setRestoreData({results:sr,doneCount:cnt,meta:parsed.meta});
+          return;
+        }
+      }
+    }catch(e){}
+    setResults({});
+    setMeta(m=>({...m,title:m.title||titleGuess}));
+    setShowMeta(true); // prompt for metadata on new book
+  };
+
+  // ── OCR single page ──
+  const ocrPage=useCallback(async(doc,n,cache,retry=0)=>{
+    let img=cache[n];
+    if(!img){img=await renderPage(doc,n,hiddenRef.current);setImgCache(c=>({...c,[n]:img}));}
+    const kb=Math.round(img.length*0.75/1024);
+    setResults(r=>({...r,[n]:{status:'processing',sections:[],notes:`Sending ~${kb}KB…`}}));
+    try{
+      const data=await callAPI({model:'claude-sonnet-4-20250514',max_tokens:4000,system:SYSTEM_PROMPT,
+        messages:[{role:'user',content:[
+          {type:'image',source:{type:'base64',media_type:'image/jpeg',data:img.split(',')[1]}},
+          {type:'text',text:'Extract all text. Return ONLY raw JSON starting with { and ending with }.'}
+        ]}]});
+      const raw=data.content?.find(b=>b.type==='text')?.text||'';
+      const parsed=extractJSON(raw);
+      setResults(r=>({...r,[n]:parsed?.sections?{status:'done',...parsed}:{status:'done',sections:raw.trim()?[{type:'prose',content:raw.trim()}]:[],notes:'Could not parse JSON.'}}));
+    }catch(err){
+      const isRL=err.errType==='exceeded_limit'||err.message?.includes('exceeded_limit');
+      if(isRL&&retry<5){
+        const wait=Math.min(120000,60000*(retry+1));
+        for(let t=Math.round(wait/1000);t>0;t--){
+          if(batchStop.current)return;
+          setResults(r=>({...r,[n]:{status:'processing',sections:[],notes:`Rate limited — retrying in ${t}s…`}}));
+          await new Promise(res=>setTimeout(res,1000));
+        }
+        if(!batchStop.current)return ocrPage(doc,n,cache,retry+1);
+      }
+      setResults(r=>({...r,[n]:{status:'error',sections:[],notes:String(err?.message||err)}}));
+    }
+  },[renderPage]);
+
+  const processOne=async()=>{setBusy(true);await ocrPage(pdfDoc,page,imgCache);setBusy(false);};
+  const processAll=async()=>{
+    setBusy(true);setBatch(true);batchStop.current=false;let snap={...imgCache};
+    for(let i=1;i<=totalPages;i++){
+      if(batchStop.current)break;
+      if(['done','skipped','image'].includes(results[i]?.status))continue;
+      setBatchPage(i);await ocrPage(pdfDoc,i,snap);await new Promise(res=>setTimeout(res,500));
+    }
+    setBatchPage(0);setBatch(false);setBusy(false);
+  };
+
+  // ── Page actions ──
+  const skipPage=n=>{pushHistory();setResults(r=>({...r,[n]:{status:'skipped',sections:[],notes:'Skipped'}}));};
+  const markAsImage=async n=>{
+    let img=imgCache[n];if(!img){img=await renderPage(pdfDoc,n,hiddenRef.current);setImgCache(c=>({...c,[n]:img}));}
+    pushHistory();setResults(r=>({...r,[n]:{status:'image',sections:[],image:img,notes:'Image page'}}));
+  };
+  const unmarkPage=n=>{pushHistory();setResults(r=>({...r,[n]:null}));};
+
+  // ── Section mutations ──
+  const updateSec=(n,idx,f,v)=>setResults(r=>({...r,[n]:{...r[n],sections:r[n].sections.map((s,i)=>i===idx?{...s,[f]:v}:s)}}));
+  const addSec=n=>{pushHistory();setResults(r=>({...r,[n]:{...r[n],sections:[...(r[n].sections||[]),{type:'prose',content:''}]}}))} ;
+  const delSec=(n,idx)=>setResults(r=>({...r,[n]:{...r[n],sections:r[n].sections.filter((_,i)=>i!==idx)}}));
+  const moveSec=(n,from,to)=>{pushHistory();setResults(r=>{const secs=[...r[n].sections],[item]=secs.splice(from,1);secs.splice(to,0,item);return{...r,[n]:{...r[n],sections:secs}};});};
+
+  // ── Save / Backup ──
+  const saveNow=()=>{
+    if(!bookKey)return;
+    const cnt=Object.values(results).filter(r=>['done','skipped','image'].includes(r?.status)).length;
+    try{localStorage.setItem(bookKey,JSON.stringify({results,totalPages,meta}));setSaveMsg('Saved ('+cnt+' pages)');setTimeout(()=>setSaveMsg(''),2500);}
+    catch(e){setSaveMsg('Save failed');}
+  };
+  const downloadBackup=()=>{
+    saveNow();
+    const data=JSON.stringify({results,totalPages,meta,bookKey},null,0);
+    const a=document.createElement('a');
+    a.href='data:application/json;charset=utf-8,'+encodeURIComponent(data);
+    a.download='rushdai-backup.json';document.body.appendChild(a);a.click();a.remove();
+    setSaveMsg('Backup downloaded');setTimeout(()=>setSaveMsg(''),3000);
+  };
+  const loadBackup=file=>{
+    const reader=new FileReader();
+    reader.onload=e=>{
+      try{
+        const data=JSON.parse(e.target.result);
+        const sr=data.results||data;
+        const cnt=Object.values(sr).filter(r=>['done','skipped','image'].includes(r?.status)).length;
+        if(cnt===0){alert('No processed pages found in backup file.');return;}
+        setRestoreData({results:sr,doneCount:cnt,meta:data.meta,isBackup:true});
+      }catch(err){alert('Could not read backup: '+err.message);}
+    };
+    reader.readAsText(file);
+  };
+
+  // ── Search & Replace ──
+  const doReplace=()=>{
+    if(!srFind.trim()){setSrCount(0);return;}
+    let total=0;
+    pushHistory();
+    setResults(prev=>{
+      const next={...prev};
+      for(const n in next){
+        const r=next[n];if(!r?.sections)continue;
+        const newSecs=r.sections.map(s=>{
+          if(!s.content)return s;
+          const flags=srCS?'g':'gi';
+          const esc=srFind.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+          const re=new RegExp(esc,flags);
+          const matches=s.content.match(re);
+          if(matches){total+=matches.length;return{...s,content:s.content.replace(re,srReplace)};}
+          return s;
+        });
+        next[n]={...r,sections:newSecs};
+      }
+      return next;
+    });
+    setSrCount(total);
+  };
+
+  // ── Test API ──
+  const testAPI=async()=>{
+    setTestMsg('Testing…');
+    try{const d=await callAPI({model:'claude-sonnet-4-20250514',max_tokens:20,messages:[{role:'user',content:'Reply: API OK'}]});setTestMsg('✓ '+(d.content?.find(b=>b.type==='text')?.text||'ok'));}
+    catch(e){setTestMsg('FAIL: '+String(e).slice(0,100));}
+  };
+
+  // ── TOC ──
+  const toc=useMemo(()=>{
+    const items=[];
+    for(let i=1;i<=totalPages;i++){const r=results[i];if(!r?.sections)continue;r.sections.filter(s=>HEADER_TYPES.has(s.type)&&s.content?.trim()).forEach(s=>items.push({page:i,text:s.content}));}
+    return items;
+  },[results,totalPages]);
+
+  const currentHeading=useMemo(()=>{
+    for(let i=page;i>=1;i--){const r=results[i];if(!r?.sections)continue;const h=r.sections.find(s=>HEADER_TYPES.has(s.type)&&s.content?.trim());if(h)return h.content;}
+    return '';
+  },[results,page]);
+
+  const done=Object.values(results).filter(r=>r?.status==='done').length;
+  const cur=results[page];
+  const dot=n=>{const s=results[n]?.status;if(s==='done')return{color:'#16a34a',c:'●'};if(s==='processing')return{color:'#f59e0b',c:'◌'};if(s==='error')return{color:'#dc2626',c:'✕'};if(s==='skipped')return{color:'#94a3b8',c:'—'};if(s==='image')return{color:'#7c3aed',c:'🖼'};return null;};
+
+  // ── Preview renderer ──
+  const renderPreview=(sections,pageNum)=>{
+    const endnotes=sections.filter(s=>s.type==='endnote');
+    const main=sections.filter(s=>s.type!=='endnote'&&!EXPORT_SKIP.has(s.type));
+    return React.createElement('div',{dir:'rtl',style:{fontFamily:"'Amiri',serif",padding:'36px 52px 72px',background:'white',minHeight:'100%',color:'#1a1a1a',position:'relative'}},
+      currentHeading&&React.createElement('div',{style:{fontSize:'0.78rem',color:'#94a3b8',textAlign:'center',borderBottom:'1px solid #f1f5f9',paddingBottom:6,marginBottom:20,direction:'rtl'}},currentHeading),
+      ...main.map((s,i)=>{
+        if(s.type==='basmala')return React.createElement('div',{key:i,style:{textAlign:'center',fontSize:'1.4rem',lineHeight:2.5,margin:'16px 0'}},s.content);
+        if(s.type==='heading')return React.createElement('h2',{key:i,dir:'rtl',style:{fontSize:'1.3rem',fontWeight:700,textAlign:'center',margin:'20px 0 14px',borderBottom:'1px solid #e2e8f0',paddingBottom:6}},s.content);
+        if(s.type==='quran')return React.createElement('div',{key:i,dir:'rtl',style:{background:'#f0fdf4',border:'2px solid #86efac',borderRadius:8,padding:'14px 20px',margin:'14px 0',textAlign:'center',fontSize:'1.25rem',lineHeight:2.8}},s.content.split('\n').map((l,j)=>React.createElement('div',{key:j},l)));
+        if(s.type==='poetry'){
+          const verses=s.content.split('\n').filter(l=>l.trim());
+          return React.createElement('div',{key:i,style:{margin:'16px auto',maxWidth:'90%'}},
+            ...verses.map((v,j)=>{
+              const parts=v.split('***');
+              if(parts.length<2)return React.createElement('div',{key:j,style:{textAlign:'center',fontSize:'1.1rem',padding:'4px 0'}},v.trim());
+              return React.createElement('div',{key:j,style:{display:'grid',gridTemplateColumns:'1fr auto 1fr',alignItems:'center',gap:8,padding:'4px 0',borderBottom:j<verses.length-1?'1px dotted #e2e8f0':'none'}},
+                React.createElement('span',{style:{textAlign:'right',fontFamily:"'Amiri',serif",fontSize:'1.1rem',direction:'rtl'}},(parts[0]||'').trim()),
+                React.createElement('span',{style:{color:'#cbd5e1',fontSize:'0.8rem',textAlign:'center'}},'◆'),
+                React.createElement('span',{style:{textAlign:'left',fontFamily:"'Amiri',serif",fontSize:'1.1rem',direction:'rtl'}},(parts[1]||'').trim())
+              );
+            })
+          );
+        }
+        if(s.type==='footnote')return React.createElement('span',{key:i,style:{fontSize:'0.75em',color:'#94a3b8',fontStyle:'italic'}},s.content);
+        return React.createElement('p',{key:i,dir:'rtl',style:{textAlign:'justify',fontSize:'1.05rem',margin:'8px 0',lineHeight:2.5}},renderInlineBrackets(s.content));
+      }),
+      endnotes.length>0&&React.createElement('div',{style:{borderTop:'1px solid #e2e8f0',marginTop:24,paddingTop:10,direction:'rtl'}},
+        ...endnotes.flatMap(en=>splitEndnotes(en.content)).map((note,j)=>React.createElement('p',{key:j,dir:'rtl',style:{fontSize:'0.78rem',color:'#475569',margin:'3px 0',lineHeight:1.9}},note))
+      ),
+      React.createElement('div',{style:{position:'absolute',bottom:20,left:0,right:0,textAlign:'center',fontSize:'0.85rem',color:'#94a3b8'}},String(pageNum))
+    );
+  };
+
+  // ── Batch progress panel ──
+  const BatchPanel=()=>{
+    const processed=Object.values(results).filter(r=>['done','error','skipped','image'].includes(r?.status)).length;
+    const pct=totalPages>0?Math.round(processed/totalPages*100):0;
+    return React.createElement('div',{style:{background:'#1e293b',color:'white',padding:'8px 14px',flexShrink:0}},
+      React.createElement('div',{style:{display:'flex',alignItems:'center',gap:10,marginBottom:5}},
+        React.createElement('span',{style:{fontSize:12,fontWeight:700,whiteSpace:'nowrap'}},batchPage>0?`Processing ${batchPage}/${totalPages}`:'Finishing…'),
+        React.createElement('div',{style:{flex:1,background:'#334155',borderRadius:4,height:6}},React.createElement('div',{style:{width:pct+'%',background:'#22c55e',height:6,borderRadius:4,transition:'width 0.4s'}})),
+        React.createElement('span',{style:{fontSize:11,color:'#94a3b8',whiteSpace:'nowrap'}},pct+'%'),
+        React.createElement('button',{onClick:()=>batchStop.current=true,style:{padding:'2px 10px',background:'#dc2626',color:'white',border:'none',borderRadius:4,fontSize:11,fontWeight:700}},'Stop')
+      ),
+      React.createElement('div',{style:{display:'flex',gap:2,flexWrap:'wrap'}},
+        Array.from({length:totalPages},(_,i)=>{const n=i+1,r=results[n];const color=!r?'#475569':r.status==='done'?'#22c55e':r.status==='error'?'#ef4444':r.status==='processing'?'#f59e0b':r.status==='skipped'?'#64748b':'#a78bfa';return React.createElement('div',{key:n,title:`Page ${n}: ${r?.status||'pending'}`,onClick:()=>setPage(n),style:{width:13,height:13,borderRadius:2,background:color,cursor:'pointer',border:n===batchPage?'2px solid white':'1px solid transparent',flexShrink:0}});})
+      )
+    );
+  };
+
+  // ── Render ────────────────────────────────────────────────────────────────
+  return React.createElement('div',{style:{display:'flex',flexDirection:'column',height:'100vh',overflow:'hidden'}},
+    React.createElement('canvas',{ref:hiddenRef,style:{display:'none'}}),
+
+    // Header
+    React.createElement('header',{style:{background:'white',borderBottom:'1px solid #e2e8f0',padding:'8px 12px',display:'flex',alignItems:'center',gap:8,flexShrink:0,flexWrap:'wrap'}},
+      React.createElement('div',{style:{flex:1,minWidth:80}},
+        React.createElement('h1',{style:{fontSize:14,fontWeight:700,color:'#1e293b',fontFamily:"'Amiri',serif"}},'RushdAI'),
+        totalPages>0&&React.createElement('p',{style:{fontSize:11,color:'#64748b'}},`${done}/${totalPages} done`,saveMsg&&React.createElement('span',{style:{color:'#16a34a',marginRight:6}},' · '+saveMsg))
+      ),
+      React.createElement('button',{onClick:()=>fileRef.current?.click(),style:{padding:'6px 12px',background:'#2563eb',color:'white',border:'none',borderRadius:6,fontSize:12,fontWeight:600}},pdfDoc?'New PDF':'Upload PDF'),
+      pdfDoc&&React.createElement('button',{onClick:saveNow,style:{padding:'6px 10px',background:'#0369a1',color:'white',border:'none',borderRadius:6,fontSize:12,fontWeight:600}},'💾 Save'),
+      pdfDoc&&React.createElement('button',{onClick:downloadBackup,style:{padding:'6px 10px',background:'#0f766e',color:'white',border:'none',borderRadius:6,fontSize:12,fontWeight:600}},'⬇ Backup'),
+      React.createElement('button',{onClick:()=>backupRef.current?.click(),style:{padding:'6px 10px',background:'#0f766e',color:'white',border:'none',borderRadius:6,fontSize:12,fontWeight:600}},'⬆ Restore'),
+      React.createElement('input',{ref:backupRef,type:'file',accept:'.json',style:{display:'none'},onChange:e=>e.target.files?.[0]&&loadBackup(e.target.files[0])}),
+      history.length>0&&React.createElement('button',{onClick:undo,style:{padding:'6px 10px',background:'#f59e0b',color:'white',border:'none',borderRadius:6,fontSize:12,fontWeight:600}},`↩ Undo (${history.length})`),
+      pdfDoc&&React.createElement('button',{onClick:()=>setShowMeta(true),style:{padding:'6px 10px',background:'#7c3aed',color:'white',border:'none',borderRadius:6,fontSize:12,fontWeight:600}},'📖 Book Info'),
+      toc.length>0&&React.createElement('button',{onClick:()=>setShowTOC(true),style:{padding:'6px 10px',background:'#7c3aed',color:'white',border:'none',borderRadius:6,fontSize:12,fontWeight:600}},'📋 TOC'),
+      done>0&&React.createElement('button',{onClick:()=>setShowSR(true),style:{padding:'6px 10px',background:'#0891b2',color:'white',border:'none',borderRadius:6,fontSize:12,fontWeight:600}},'🔍 S&R'),
+      React.createElement('button',{onClick:testAPI,style:{padding:'6px 10px',background:'#0f172a',color:'white',border:'none',borderRadius:6,fontSize:12,fontWeight:600}},'Test API'),
+      testMsg&&React.createElement('span',{style:{fontSize:11,color:testMsg.startsWith('✓')?'#16a34a':'#dc2626',maxWidth:180,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},testMsg),
+      done>0&&React.createElement('button',{onClick:()=>setShowExport(true),style:{padding:'6px 12px',background:'#16a34a',color:'white',border:'none',borderRadius:6,fontSize:12,fontWeight:600}},'📤 Export'),
+      React.createElement('input',{ref:fileRef,type:'file',accept:'.pdf',style:{display:'none'},onChange:e=>e.target.files?.[0]&&loadPDF(e.target.files[0])})
+    ),
+
+    batchRunning&&React.createElement(BatchPanel),
+
+    // Empty state
+    !pdfDoc
+      ?React.createElement('div',{style:{flex:1,display:'flex',alignItems:'center',justifyContent:'center'}},
+          React.createElement('div',{style:{textAlign:'center',padding:24}},
+            React.createElement('div',{style:{fontSize:48,marginBottom:12}},'📖'),
+            React.createElement('h2',{style:{color:'#1e293b',marginBottom:4,fontFamily:"'Amiri',serif",fontSize:'2rem'}},'\u0631\u064F\u0634\u062F\u0020\u0041\u0049'),
+            React.createElement('p',{style:{color:'#7c3aed',marginBottom:10,fontSize:13,fontWeight:600}},'Transform Arabic Heritage into Living Books'),
+            React.createElement('p',{style:{color:'#64748b',marginBottom:20,lineHeight:1.8,maxWidth:380,fontSize:14}},'Upload any scanned Arabic book and RushdAI reads every page — recognising prose, poetry, Quranic verses, chapter headings, footnotes and endnotes — then exports a beautifully structured EPUB and PDF ready to share with readers worldwide.'),
+            React.createElement('button',{onClick:()=>fileRef.current?.click(),style:{padding:'10px 24px',background:'#2563eb',color:'white',border:'none',borderRadius:8,fontSize:15,fontWeight:600}},'Choose PDF')
+          )
+        )
+
+      // Two-panel view
+      :React.createElement('div',{style:{flex:1,display:'flex',overflow:'hidden'}},
+          // Left: PDF viewer
+          React.createElement('div',{style:{width:'48%',display:'flex',flexDirection:'column',borderRight:'1px solid #e2e8f0',background:'#f1f5f9'}},
+            React.createElement('div',{style:{padding:'6px 8px',background:'white',borderBottom:'1px solid #e2e8f0',display:'flex',alignItems:'center',gap:5,flexShrink:0,flexWrap:'wrap'}},
+              React.createElement('button',{onClick:()=>setPage(p=>Math.max(1,p-1)),disabled:page===1,style:{padding:'3px 9px',border:'1px solid #e2e8f0',borderRadius:4,background:'white',fontWeight:700,opacity:page===1?.4:1}},'‹'),
+              React.createElement('span',{style:{fontSize:12,color:'#475569',minWidth:60,textAlign:'center'}},
+                (()=>{const d=dot(page);return d?React.createElement('span',{style:{color:d.color,marginLeft:3}},d.c):null;})(),` ${page}/${totalPages}`),
+              React.createElement('button',{onClick:()=>setPage(p=>Math.min(totalPages,p+1)),disabled:page===totalPages,style:{padding:'3px 9px',border:'1px solid #e2e8f0',borderRadius:4,background:'white',fontWeight:700,opacity:page===totalPages?.4:1}},'›'),
+              React.createElement('div',{style:{flex:1}}),
+              React.createElement('button',{onClick:processOne,disabled:busy,style:{padding:'4px 10px',background:'#2563eb',color:'white',border:'none',borderRadius:4,fontSize:11,fontWeight:700,opacity:busy?.6:1}},'OCR'),
+              batchRunning
+                ?React.createElement('button',{onClick:()=>batchStop.current=true,style:{padding:'4px 8px',background:'#dc2626',color:'white',border:'none',borderRadius:4,fontSize:11,fontWeight:700}},'Stop')
+                :React.createElement('button',{onClick:processAll,disabled:busy,style:{padding:'4px 8px',background:'#7c3aed',color:'white',border:'none',borderRadius:4,fontSize:11,fontWeight:700}},'All▶'),
+              React.createElement('button',{onClick:()=>skipPage(page),style:{padding:'4px 8px',background:'#f1f5f9',color:'#64748b',border:'1px solid #e2e8f0',borderRadius:4,fontSize:11,fontWeight:700}},'Skip'),
+              React.createElement('button',{onClick:()=>markAsImage(page),style:{padding:'4px 8px',background:'#f5f3ff',color:'#7c3aed',border:'1px solid #ddd6fe',borderRadius:4,fontSize:11}},'\uD83D\uDDBC')
+            ),
+            React.createElement('div',{style:{flex:1,overflow:'auto',padding:8}},React.createElement('canvas',{ref:canvasRef,style:{width:'100%',boxShadow:'0 2px 8px rgba(0,0,0,0.15)'}}))
+          ),
+
+          // Right: Results
+          React.createElement('div',{style:{width:'52%',display:'flex',flexDirection:'column',overflow:'hidden'}},
+            React.createElement('div',{style:{padding:'6px 12px',background:'white',borderBottom:'1px solid #e2e8f0',display:'flex',alignItems:'center',gap:8,flexShrink:0}},
+              React.createElement('span',{style:{flex:1,fontSize:12,fontWeight:700,color:'#1e293b'}},'النص المستخرج'),
+              cur?.status==='done'&&React.createElement('button',{onClick:()=>setPreview(v=>!v),style:{fontSize:11,padding:'3px 10px',border:'1px solid #7c3aed',borderRadius:4,background:preview?'#7c3aed':'white',color:preview?'white':'#7c3aed',fontWeight:600}},preview?'✎ Edit':'👁 Preview'),
+              cur?.status==='done'       &&React.createElement('span',{style:{fontSize:10,background:'#dcfce7',color:'#16a34a',padding:'2px 7px',borderRadius:10,fontWeight:700}},'✓ Done'),
+              cur?.status==='processing' &&React.createElement('span',{style:{fontSize:10,background:'#fef9c3',color:'#b45309',padding:'2px 7px',borderRadius:10}},'⟳'),
+              cur?.status==='error'      &&React.createElement('span',{style:{fontSize:10,background:'#fee2e2',color:'#dc2626',padding:'2px 7px',borderRadius:10}},'✕ Error'),
+              cur?.status==='skipped'    &&React.createElement('span',{style:{fontSize:10,background:'#f1f5f9',color:'#64748b',padding:'2px 7px',borderRadius:10}},'— Skipped'),
+              cur?.status==='image'      &&React.createElement('span',{style:{fontSize:10,background:'#f5f3ff',color:'#7c3aed',padding:'2px 7px',borderRadius:10}},'🖼 Image')
+            ),
+            React.createElement('div',{style:{flex:1,overflow:'auto',padding:preview?0:10,background:preview?'#e5e7eb':'#f8fafc'}},
+              !cur?React.createElement('div',{style:{textAlign:'center',marginTop:60,color:'#94a3b8'}},React.createElement('div',{style:{fontSize:32,marginBottom:8}},'🔍'),React.createElement('p',{style:{fontWeight:500,fontSize:13}},'Click OCR to extract text'),React.createElement('p',{style:{fontSize:11,marginTop:4,color:'#cbd5e1'}},'Or All▶ to process all pages'))
+              :cur.status==='processing'?React.createElement('div',{style:{textAlign:'center',marginTop:60,color:'#64748b'}},React.createElement('div',{style:{fontSize:32,marginBottom:8}},'🔄'),React.createElement('p',{style:{fontWeight:500,fontSize:13}},'Analyzing…'),React.createElement('p',{style:{fontSize:11,marginTop:4}},cur.notes))
+              :cur.status==='error'?React.createElement('div',{style:{background:'#fef2f2',border:'1px solid #fecaca',borderRadius:8,padding:14,color:'#b91c1c',margin:4}},React.createElement('strong',null,'Error:'),React.createElement('p',{style:{marginTop:6,fontSize:11,fontFamily:'monospace',background:'white',padding:8,borderRadius:4,wordBreak:'break-all'}},cur.notes),React.createElement('button',{onClick:processOne,disabled:busy,style:{marginTop:8,padding:'4px 12px',background:'#dc2626',color:'white',border:'none',borderRadius:4,fontSize:12,fontWeight:700}},'↺ Retry'))
+              :cur.status==='skipped'?React.createElement('div',{style:{textAlign:'center',marginTop:60,color:'#94a3b8'}},React.createElement('p',{style:{fontSize:14}},'— Page skipped —'),React.createElement('button',{onClick:()=>unmarkPage(page),style:{marginTop:12,padding:'5px 14px',border:'1px solid #e2e8f0',borderRadius:5,background:'white',fontSize:12}},'Un-skip'))
+              :cur.status==='image'?React.createElement('div',{style:{textAlign:'center',padding:20}},cur.image&&React.createElement('img',{src:cur.image,style:{maxWidth:'100%',boxShadow:'0 2px 8px rgba(0,0,0,0.1)',borderRadius:4,marginBottom:12}}),React.createElement('p',{style:{fontSize:12,color:'#7c3aed',fontWeight:600,marginBottom:8}},'🖼 Image page'),React.createElement('button',{onClick:()=>unmarkPage(page),style:{padding:'5px 14px',border:'1px solid #ddd6fe',borderRadius:5,background:'white',fontSize:12}},'Unmark'))
+              :(preview&&cur.status==='done')?React.createElement('div',{style:{maxWidth:720,margin:'0 auto',background:'white',minHeight:'100%',boxShadow:'0 0 20px rgba(0,0,0,0.1)'}},renderPreview(cur.sections||[],page))
+              :React.createElement('div',{style:{display:'flex',flexDirection:'column',gap:8}},
+                  ...(cur.sections||[]).map((sec,i)=>React.createElement(SectionCard,{key:i,sec,idx:i,pageNum:page,onUpdate:(idx,f,v)=>updateSec(page,idx,f,v),onDelete:idx=>delSec(page,idx),onMove:(from,to)=>moveSec(page,from,to),onPushHistory:pushHistory})),
+                  React.createElement('button',{onClick:()=>addSec(page),style:{padding:6,border:'2px dashed #cbd5e1',borderRadius:6,background:'transparent',color:'#94a3b8',fontSize:12}},'Add section +'),
+                  cur.notes?.trim()&&React.createElement('div',{style:{fontSize:11,color:'#64748b',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:6,padding:'6px 10px'}},cur.notes)
+                )
+            )
+          )
+        ),
+
+    // ── Modals ────────────────────────────────────────────────────────────────
+
+    // Book metadata modal
+    showMeta&&React.createElement('div',{style:{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000,padding:16}},
+      React.createElement('div',{style:{background:'white',borderRadius:12,padding:20,width:'100%',maxWidth:480}},
+        React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16}},
+          React.createElement('h3',{style:{fontSize:15,fontWeight:700}},'📖 Book Information'),
+          React.createElement('button',{onClick:()=>setShowMeta(false),style:{border:'none',background:'none',fontSize:20,cursor:'pointer',color:'#64748b'}},'✕')
+        ),
+        [['title','Book Title (عنوان الكتاب)'],['author','Author (المؤلف)'],['disclaimerAr','Disclaimer — Arabic'],['disclaimerEn','Disclaimer — English']].map(([field,label])=>
+          React.createElement('div',{key:field,style:{marginBottom:12}},
+            React.createElement('label',{style:{fontSize:12,color:'#475569',display:'block',marginBottom:4}},label),
+            React.createElement(field==='disclaimerAr'||field==='disclaimerEn'?'textarea':'input',{
+              value:meta[field]||'',
+              onChange:e=>setMeta(m=>({...m,[field]:e.target.value})),
+              dir:field==='disclaimerEn'?'ltr':'rtl',
+              rows:field.startsWith('disclaimer')?3:undefined,
+              style:{width:'100%',padding:'7px 10px',border:'1px solid #e2e8f0',borderRadius:6,fontSize:13,fontFamily:"'Amiri',serif",direction:field==='disclaimerEn'?'ltr':'rtl',textAlign:field==='disclaimerEn'?'left':'right',resize:'vertical'}
+            })
+          )
+        ),
+        React.createElement('button',{onClick:()=>setShowMeta(false),style:{width:'100%',padding:'9px',background:'#2563eb',color:'white',border:'none',borderRadius:6,fontSize:14,fontWeight:700,cursor:'pointer',marginTop:4}},'Save')
+      )
+    ),
+
+    // Restore modal
+    restoreData&&React.createElement('div',{style:{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000,padding:16}},
+      React.createElement('div',{style:{background:'white',borderRadius:12,padding:24,width:'100%',maxWidth:380,textAlign:'center'}},
+        React.createElement('div',{style:{fontSize:36,marginBottom:10}},'💾'),
+        React.createElement('h3',{style:{marginBottom:8,color:'#1e293b'}},'Saved progress found'),
+        React.createElement('p',{style:{color:'#64748b',marginBottom:20,fontSize:14}},restoreData.doneCount+' pages found. '+(restoreData.isBackup?'Load from backup file?':'Restore from saved session?')),
+        React.createElement('div',{style:{display:'flex',gap:10,justifyContent:'center'}},
+          React.createElement('button',{onClick:()=>{setResults(restoreData.results);if(restoreData.meta)setMeta(restoreData.meta);setSaveMsg('Restored '+restoreData.doneCount+' pages');setTimeout(()=>setSaveMsg(''),3000);setRestoreData(null);},style:{padding:'8px 20px',background:'#2563eb',color:'white',border:'none',borderRadius:6,fontSize:14,fontWeight:700}},'Yes, restore'),
+          React.createElement('button',{onClick:()=>{setResults({});setRestoreData(null);},style:{padding:'8px 20px',background:'#f1f5f9',color:'#475569',border:'1px solid #e2e8f0',borderRadius:6,fontSize:14,fontWeight:700}},'Start fresh')
+        )
+      )
+    ),
+
+    // TOC modal
+    showTOC&&React.createElement('div',{style:{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000,padding:16}},
+      React.createElement('div',{style:{background:'white',borderRadius:12,padding:20,width:'100%',maxWidth:520,maxHeight:'80vh',display:'flex',flexDirection:'column'}},
+        React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:12}},
+          React.createElement('h3',{style:{fontSize:14}},'📋 فهرس المحتويات'),
+          React.createElement('button',{onClick:()=>setShowTOC(false),style:{border:'none',background:'none',fontSize:20,cursor:'pointer',color:'#64748b'}},'✕')
+        ),
+        React.createElement('div',{style:{flex:1,overflow:'auto'}},
+          toc.length===0?React.createElement('p',{style:{color:'#94a3b8',textAlign:'center',marginTop:20,fontSize:13}},'No headings detected yet')
+          :toc.map((item,i)=>React.createElement('div',{key:i,onClick:()=>{setPage(item.page);setShowTOC(false);},style:{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 4px',borderBottom:'1px solid #f1f5f9',cursor:'pointer'}},
+              React.createElement('span',{className:'ar',style:{fontSize:13,flex:1,paddingRight:8}},item.text),
+              React.createElement('span',{style:{fontSize:11,color:'#94a3b8',whiteSpace:'nowrap'}},'p. '+item.page)
+            ))
+        )
+      )
+    ),
+
+    // Search & Replace modal
+    showSR&&React.createElement('div',{style:{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000,padding:16}},
+      React.createElement('div',{style:{background:'white',borderRadius:12,padding:20,width:'100%',maxWidth:440}},
+        React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16}},
+          React.createElement('h3',{style:{fontSize:15,fontWeight:700}},'🔍 Search & Replace'),
+          React.createElement('button',{onClick:()=>{setShowSR(false);setSrCount(null);},style:{border:'none',background:'none',fontSize:20,cursor:'pointer',color:'#64748b'}},'✕')
+        ),
+        React.createElement('div',{style:{marginBottom:10}},
+          React.createElement('label',{style:{fontSize:12,color:'#475569',display:'block',marginBottom:4}},'Find'),
+          React.createElement('input',{value:srFind,onChange:e=>setSrFind(e.target.value),dir:'rtl',style:{width:'100%',padding:'8px 10px',border:'1px solid #e2e8f0',borderRadius:6,fontSize:14,fontFamily:"'Amiri',serif",direction:'rtl',textAlign:'right'}})
+        ),
+        React.createElement('div',{style:{marginBottom:10}},
+          React.createElement('label',{style:{fontSize:12,color:'#475569',display:'block',marginBottom:4}},'Replace with'),
+          React.createElement('input',{value:srReplace,onChange:e=>setSrReplace(e.target.value),dir:'rtl',style:{width:'100%',padding:'8px 10px',border:'1px solid #e2e8f0',borderRadius:6,fontSize:14,fontFamily:"'Amiri',serif",direction:'rtl',textAlign:'right'}})
+        ),
+        React.createElement('label',{style:{display:'flex',alignItems:'center',gap:6,fontSize:12,color:'#475569',marginBottom:16,cursor:'pointer'}},
+          React.createElement('input',{type:'checkbox',checked:srCS,onChange:e=>setSrCS(e.target.checked)}),'Case sensitive'),
+        React.createElement('div',{style:{display:'flex',gap:8,alignItems:'center'}},
+          React.createElement('button',{onClick:doReplace,style:{flex:1,padding:'9px',background:'#2563eb',color:'white',border:'none',borderRadius:6,fontSize:13,fontWeight:700,cursor:'pointer'}},'Replace All'),
+          srCount!==null&&React.createElement('span',{style:{fontSize:12,color:srCount>0?'#16a34a':'#94a3b8',fontWeight:600}},srCount>0?`✓ ${srCount} replaced`:'No matches')
+        )
+      )
+    ),
+
+    // Export modal
+    showExport&&React.createElement('div',{style:{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1000,padding:16}},
+      React.createElement('div',{style:{background:'white',borderRadius:12,padding:20,width:'100%',maxWidth:460}},
+        React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:8}},
+          React.createElement('h3',{style:{fontSize:15,fontWeight:700}},'📤 Export'),
+          React.createElement('button',{onClick:()=>setShowExport(false),style:{border:'none',background:'none',fontSize:20,cursor:'pointer',color:'#64748b'}},'✕')
+        ),
+        React.createElement('p',{style:{fontSize:12,color:'#64748b',marginBottom:16}},'Exporting: '+(meta.title||'Untitled')+' · '+done+' pages ready'),
+        !meta.title&&React.createElement('p',{style:{fontSize:12,color:'#f59e0b',marginBottom:12,background:'#fef9c3',padding:'6px 10px',borderRadius:6}},'⚠️ No book title set — click 📖 Book Info to add one first'),
+        React.createElement('div',{style:{display:'flex',flexDirection:'column',gap:10}},
+          React.createElement('button',{onClick:()=>{buildEPUBExport(results,totalPages,meta);},
+            style:{padding:'10px',background:'#7c3aed',color:'white',border:'none',borderRadius:8,fontSize:14,fontWeight:700,cursor:'pointer'}},'📚 Download EPUB'),
+          React.createElement('button',{onClick:()=>{setShowExport(false);buildPDFExport(results,totalPages,meta);},
+            style:{padding:'10px',background:'#0369a1',color:'white',border:'none',borderRadius:8,fontSize:14,fontWeight:700,cursor:'pointer'}},'📄 Export PDF (open in browser → print to save)'),
+          React.createElement('button',{onClick:()=>{setExportText(buildTextExport(results,totalPages));setShowExport(false);},
+            style:{padding:'10px',background:'#475569',color:'white',border:'none',borderRadius:8,fontSize:14,fontWeight:700,cursor:'pointer'}},'📝 Plain Text')
+        ),
+        React.createElement('p',{style:{fontSize:11,color:'#94a3b8',marginTop:12,textAlign:'center'}},'EPUB filename = book title (controls Apple Books running header)')
+      )
+    ),
+
+    // Text export modal
+    exportText!==null&&React.createElement('div',{style:{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:1001,padding:16}},
+      React.createElement('div',{style:{background:'white',borderRadius:12,padding:16,width:'100%',maxWidth:580,maxHeight:'82vh',display:'flex',flexDirection:'column',gap:10}},
+        React.createElement('div',{style:{display:'flex',alignItems:'center',justifyContent:'space-between'}},
+          React.createElement('strong',{style:{fontSize:14}},'النص المستخرج'),
+          React.createElement('button',{onClick:()=>setExportText(null),style:{border:'none',background:'none',fontSize:20,cursor:'pointer',color:'#64748b'}},'✕')
+        ),
+        React.createElement('textarea',{readOnly:true,value:exportText,dir:'rtl',style:{flex:1,minHeight:340,fontFamily:"'Amiri',serif",fontSize:'1rem',lineHeight:2,border:'1px solid #e2e8f0',borderRadius:6,padding:10,resize:'none'}}),
+        React.createElement('div',{style:{display:'flex',gap:8}},
+          React.createElement('button',{onClick:()=>navigator.clipboard?.writeText(exportText).then(()=>alert('Copied!')).catch(()=>alert('Select all and copy manually')),style:{flex:1,padding:'8px',background:'#2563eb',color:'white',border:'none',borderRadius:6,fontSize:13,fontWeight:700,cursor:'pointer'}},'📋 Copy'),
+          React.createElement('button',{onClick:()=>{const a=document.createElement('a');a.href='data:text/plain;charset=utf-8,'+encodeURIComponent(exportText);a.download=(meta.title||'arabic-book')+'.txt';a.click();},style:{flex:1,padding:'8px',background:'#16a34a',color:'white',border:'none',borderRadius:6,fontSize:13,fontWeight:700,cursor:'pointer'}},'⬇ Download .txt')
+        )
+      )
+    )
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>
