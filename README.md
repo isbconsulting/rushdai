@@ -89,11 +89,15 @@ The PDF is generated as a print-ready HTML file — open in Chrome and print to 
 
 - **A4 page size** with professional margins
 - **Title page** with disclaimer and RushdAI credit
-- **Running chapter header** at top of each page
+- **Running chapter header** at top of each page via CSS `string-set`
 - **Page numbers** centered at bottom
-- **Chapter-end footnotes** — each chapter's endnotes collected after its text, separated by a rule
+- **Chapter-end footnotes** — each chapter's endnotes collected immediately after its text, separated by a horizontal rule. No navigation required — footnotes are always close to their source text.
+- **Image pages** — scanned pages marked as 🖼 are embedded full-width on their own isolated page
+- **Orphan prevention** — headings and basmalas at the bottom of a page are pushed to the next page so they're never stranded alone
 - **Poetry** in two-column table layout
 - **Quran** in a bordered green box
+
+> **Note:** True page-bottom footnotes (like a printed book) require a commercial PDF engine (Prince XML). Chapter-end footnotes are the practical equivalent for HTML-to-PDF workflows.
 
 ---
 
@@ -139,7 +143,7 @@ Built with pure JavaScript `DataView` byte-writing (no external dependencies):
 
 ### Storage
 - `localStorage` keyed by `ocr:{filename}_{filesize}`
-- JSON backup format: `{results, totalPages, meta, bookKey}`
+- JSON backup format: `{results, totalPages, meta, bookKey}` — includes book title, author, and disclaimer
 - No server dependency
 
 ---
@@ -161,10 +165,10 @@ RushdAI uses the Anthropic Claude API through Claude.ai's proxy. The API calls w
 ## 🗺️ Roadmap
 
 - [ ] API key input field for standalone deployment (no Claude.ai required)
-- [ ] Cover image support
 - [ ] Multi-book library management
 - [ ] Collaborative review (shared JSON format)
 - [ ] Server-side PDF generation with true page-bottom footnotes
+- [x] Cover image / image page support — mark any page as 🖼 and it embeds full-width in both EPUB and PDF
 
 ---
 
